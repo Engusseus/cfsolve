@@ -33,7 +33,9 @@ use crate::js::{JsValue, Options, Payload, Window};
 use crate::resource_timing::{LoadTiming, Phases, ResourceMeasurement};
 use crate::script::Source;
 use crate::stage2::call_stack::{self, CaseOpcodes, ScriptPosition};
-use crate::stage2::challenge_page::{self, CompletionTarget, Form, PrecursorProgram, Settled, WidgetProgram};
+use crate::stage2::challenge_page::{
+    self, CompletionTarget, Form, PrecursorProgram, Settled, WidgetProgram,
+};
 use crate::stage2::payload::{Environment, State};
 use crate::{embedding_page, performance_clock};
 

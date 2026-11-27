@@ -472,7 +472,12 @@ impl Reader<'_> {
         };
         // The `/fo/` segment and the platform prefix are literal parts of the address; the option
         // reads between them are the variant and the ray and token, never the route.
-        let posts = |parts: &Vec<Expression>| parts.iter().filter_map(literal).any(|text| text.contains("/fo/"));
+        let posts = |parts: &Vec<Expression>| {
+            parts
+                .iter()
+                .filter_map(literal)
+                .any(|text| text.contains("/fo/"))
+        };
         let assigned = self
             .index
             .stores()
@@ -480,19 +485,17 @@ impl Reader<'_> {
             .filter(|store| store.key == "src")
             .filter_map(|store| self.concatenation(store.pc, &store.value));
         let passed = self.index.effects_in(..).flat_map(|(pc, effect)| {
-            effect
-                .call()
-                .into_iter()
-                .flat_map(move |(_, arguments)| {
-                    arguments
-                        .iter()
-                        .filter_map(move |argument| self.concatenation(pc, argument))
-                })
+            effect.call().into_iter().flat_map(move |(_, arguments)| {
+                arguments
+                    .iter()
+                    .filter_map(move |argument| self.concatenation(pc, argument))
+            })
         });
         let addresses = assigned.chain(passed).filter(on_platform);
         // Split the posting `/fo/` endpoint from a loaded script address.
         let (submit, script): (Vec<_>, Vec<_>) = addresses.partition(posts);
-        if let Some(script) = candidates::at_most_one_distinct(script, "precursor script address")? {
+        if let Some(script) = candidates::at_most_one_distinct(script, "precursor script address")?
+        {
             return Ok(Completion::Script(script));
         }
         let submit = candidates::at_most_one_distinct(submit, "challenge submission address")?

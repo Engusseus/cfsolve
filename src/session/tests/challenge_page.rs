@@ -107,14 +107,8 @@ fn the_direct_submit_snapshot_omits_the_program_load() {
         request: 0.5,
         response: 0.25,
     };
-    let entries = challenge_page::page_resource_timing(
-        &timing,
-        phases,
-        &navigation,
-        &loads,
-        &post,
-        None,
-    );
+    let entries =
+        challenge_page::page_resource_timing(&timing, phases, &navigation, &loads, &post, None);
     assert_eq!(
         entries,
         [
