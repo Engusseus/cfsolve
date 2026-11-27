@@ -154,6 +154,11 @@ fn murmur3_fmix64(mut value: u64) -> u64 {
 }
 
 #[cfg(unix)]
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "the `timespec` fields are `i64` on 64-bit targets but `i32` on 32-bit ones, so the \
+              casts are needed there; `expect` would fail on the targets that need them"
+)]
 fn monotonic_us() -> i64 {
     let mut time = libc::timespec {
         tv_sec: 0,
