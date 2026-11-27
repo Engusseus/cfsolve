@@ -163,6 +163,21 @@ fn the_clearance_form_passes_when_it_sets_the_cookie_whatever_the_pages_status()
     assert!(!refused(StatusCode::OK, false, None));
 }
 
+/// A page can guard its content with more than one challenge stage: it answers a `managed`
+/// clearance with a `precursor_interstitial` whose own cookie it wants before it serves the page,
+/// so that stage is run next. The same stage over again means the clearance does not work and must
+/// be refused rather than chased, and an unnamed stage is not followed blindly either.
+#[test]
+fn a_differently_named_stage_after_a_clearance_is_run_next() {
+    use challenge_page::is_further_stage as further;
+    assert!(further(Some("precursor_interstitial"), Some("managed")));
+    assert!(!further(Some("managed"), Some("managed")));
+    // A stage without a name, on either side, counts as the same challenge.
+    assert!(!further(Some("managed"), None));
+    assert!(!further(None, Some("managed")));
+    assert!(!further(None, None));
+}
+
 /// Rebuilds the loader's render stack from a challenge-page capture named by
 /// `CFSOLVE_CHALLENGE_CAPTURE` and compares it with the stack the browser reported. The
 /// directory holds `page-url.txt`, `page.html`, `orchestrator.js`, the orchestrator's first

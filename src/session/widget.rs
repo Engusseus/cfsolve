@@ -5,7 +5,7 @@ use serde::Serialize;
 use url::Url;
 use wreq::cookie::Cookie;
 
-use super::challenge_page::{self, Begun, OrchestratorSession, PrecursorSession};
+use super::challenge_page::{self, Begun, Cleared, OrchestratorSession, PrecursorSession};
 use super::channel::{Channel, Origin, PostResult, Stage};
 use super::initial::{self, EmbeddingPage, Fetched, Merged};
 use super::timing::Timer;
@@ -83,7 +83,8 @@ pub(crate) async fn navigate(
 
 /// Runs the named widget through completion, or uses the page's first widget if `expect` names
 /// none. For challenge pages, also runs the orchestrator and submits the clearance form.
-/// Rejects unexpected page types before sending.
+/// Rejects unexpected page types before sending. A page that guards its content with more than
+/// one challenge stage runs the later stages too, each with the cookies the earlier ones earned.
 pub(crate) async fn native(
     client: &BrowserClient,
     sink: &dyn Sink,
@@ -93,28 +94,56 @@ pub(crate) async fn native(
     expect: Expect<'_>,
     solve: &Solve,
 ) -> Result<Outcome> {
-    let (orchestrator, embedding_page) =
-        match land(client, sink, document, navigation, page, expect).await? {
-            Landing::Site(embedding_page) => (None, embedding_page),
+    let mut document = document;
+    let mut navigation = navigation;
+    let mut stages = 0;
+    loop {
+        let cleared = match land(client, sink, document, navigation, page, expect).await? {
+            // A site's page earns the widget's token; a challenge page around that widget clears
+            // below, so only the site landing ends the run here.
+            Landing::Site(embedding_page) => {
+                let session = start_widget(client, sink, page, &embedding_page).await?;
+                let completion = session.solve(&embedding_page, solve).await?;
+                return Ok(Outcome::Token(completion.token));
+            }
             Landing::ChallengePage(orchestrator, embedding_page) => {
-                (Some(orchestrator), embedding_page)
+                let session = start_widget(client, sink, page, &embedding_page).await?;
+                let completion = session.solve(&embedding_page, solve).await?;
+                orchestrator.clear(&session, completion).await?
             }
             // The precursor script takes the widget's place, so the orchestrator clears the page
             // on its own.
-            Landing::Precursor(precursor) => {
-                let clearance = precursor.clear(client, sink).await?;
-                return Ok(Outcome::Cleared(clearance));
-            }
+            Landing::Precursor(precursor) => precursor.clear(client, sink).await?,
         };
-    let session = start_widget(client, sink, page, &embedding_page).await?;
-    let completion = session.solve(&embedding_page, solve).await?;
-    match orchestrator {
-        None => Ok(Outcome::Token(completion.token)),
-        Some(orchestrator) => {
-            let clearance = orchestrator.clear(&session, completion).await?;
-            Ok(Outcome::Cleared(clearance))
+        match cleared {
+            Cleared::Page(clearance) => return Ok(Outcome::Cleared(clearance)),
+            Cleared::NextStage {
+                document: next,
+                navigation: next_navigation,
+            } => {
+                stages += 1;
+                ensure_more_stages(stages)?;
+                document = next;
+                navigation = next_navigation;
+            }
         }
     }
+}
+
+/// The most challenge stages one page may guard itself with before the run gives up.
+const MAX_STAGES: usize = 4;
+
+/// Stops a page that keeps answering with new challenge stages from being chased forever. This is
+/// not a refusal: no stage rejected the answers, the solver just does not know how many more the
+/// page has.
+fn ensure_more_stages(stages: usize) -> Result<()> {
+    if stages >= MAX_STAGES {
+        bail!(
+            "the protected page stayed challenged through {stages} challenge stages, so the \
+             solver stopped rather than chase an unbounded sequence of clearances"
+        );
+    }
+    Ok(())
 }
 
 /// Sends the first payload for the named widget, or the page's first widget if `expect` names

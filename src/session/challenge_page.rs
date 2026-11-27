@@ -2,7 +2,8 @@
 //! widget. Its first response renders the widget; its second payload reports the widget's
 //! completion, and the response submits a clearance form that sets `cf_clearance`. On a
 //! precursor interstitial, the first response loads Cloudflare's precursor script instead of a
-//! widget, and the second payload reports that the script ran.
+//! widget, and the second payload reports that the script ran. A page can guard its content with
+//! more than one such stage; [`Cleared::NextStage`] hands the next one back to the caller.
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
@@ -64,6 +65,19 @@ struct Orchestration {
     post: LoadTiming,
     /// Fetch phase estimates used when only total duration is measured.
     phases: Phases,
+}
+
+/// What a challenge stage left behind.
+pub(crate) enum Cleared {
+    /// The stage granted a working clearance for the protected page.
+    Page(Clearance),
+    /// The cleared address is still challenged, by a *different* stage of the same guard: the
+    /// site wants that stage's own cookie before it serves the page. The caller runs it next,
+    /// with the session's cookies.
+    NextStage {
+        document: PageDocument,
+        navigation: LoadTiming,
+    },
 }
 
 /// The orchestrator's session, between its first payload and its second, around the widget its
@@ -311,7 +325,7 @@ impl OrchestratorSession {
         &self,
         widget: &WidgetSession<'_>,
         completion: Completion,
-    ) -> Result<Clearance> {
+    ) -> Result<Cleared> {
         let orchestration = &self.orchestration;
         let settled = Settled {
             after_challenge: challenge_page::completion_extra(&completion.listing),
@@ -351,7 +365,7 @@ impl PrecursorSession {
     /// fetched over a GET. A direct-submit build (EB Games) concatenates the challenge's own
     /// `/fo/` payload endpoint and hands it to the orchestrator's sender, which posts the second
     /// payload straight to it — the same endpoint the first payload used — with no script to load.
-    pub(crate) async fn clear(&self, client: &BrowserClient, sink: &dyn Sink) -> Result<Clearance> {
+    pub(crate) async fn clear(&self, client: &BrowserClient, sink: &dyn Sink) -> Result<Cleared> {
         let orchestration = &self.orchestration;
         let target = self.program.target(
             &orchestration.request.options,
@@ -371,7 +385,7 @@ impl PrecursorSession {
         client: &BrowserClient,
         sink: &dyn Sink,
         script: &Url,
-    ) -> Result<Clearance> {
+    ) -> Result<Cleared> {
         let orchestration = &self.orchestration;
         // The program creates its record, then inserts the script into the page, whose address
         // the orchestrator has restored by now. The script calls back as soon as it has run,
@@ -417,7 +431,12 @@ impl PrecursorSession {
     /// endpoint, not a script, so there is no load. It opens and closes its record in the same
     /// synchronous turn (duration zero) and posts the second payload straight to that endpoint,
     /// which is the orchestrator's own POST URL.
-    async fn submit(&self, client: &BrowserClient, sink: &dyn Sink, address: &Url) -> Result<Clearance> {
+    async fn submit(
+        &self,
+        client: &BrowserClient,
+        sink: &dyn Sink,
+        address: &Url,
+    ) -> Result<Cleared> {
         let orchestration = &self.orchestration;
         ensure!(
             *address == orchestration.request.url,
@@ -479,7 +498,7 @@ impl Orchestration {
         load: Option<ProgramLoad<'_>>,
         ended_ms: i64,
         plaintext: impl FnOnce(&Options) -> Result<Payload>,
-    ) -> Result<Clearance> {
+    ) -> Result<Cleared> {
         let mut options = self.request.options.clone();
         if let Some(timing) = &self.state.timing {
             let entries = self.page_resource_timing(timing, load);
@@ -503,7 +522,7 @@ impl Orchestration {
         options: &Options,
         mut plaintext: Payload,
         send_at: i64,
-    ) -> Result<Clearance> {
+    ) -> Result<Cleared> {
         payload::append_send_time_at(&mut plaintext, &self.state, options, send_at);
         let channel = Channel {
             client,
@@ -517,6 +536,7 @@ impl Orchestration {
         // A managed challenge grants clearance on the completion POST itself (its response sets
         // `cf_clearance` and reloads the page it rewrote itself to while orchestrating); a
         // precursor or widget challenge returns a clearance form whose submission sets the cookie.
+        let timer = Timer::start();
         let cleared = if self.granted_clearance(client) {
             sink.progress("The completion POST set cf_clearance; reloading the page it cleared");
             http::navigate(client, &self.challenge.loading).await?
@@ -524,10 +544,27 @@ impl Orchestration {
             self.submit_clearance_form(client, sink, options, &returned.program)
                 .await?
         };
+        let navigation = timer.overall(cleared.url.as_str(), cleared.html.len() as u64);
         sink.save("cleared.html", cleared.html.as_bytes())?;
-        // The cleared page must come back unchallenged. A cookie that leaves the guarded page
-        // still challenging is not a working clearance, so `accept_clearance` rejects it.
-        let challenged = ChallengePage::parse(&cleared.html, &cleared.url)?.is_some();
+        let next = ChallengePage::parse(&cleared.html, &cleared.url)?;
+        // A page can guard its content with more than one challenge stage. The reload after a
+        // clearance can answer with a different stage (`precursor_interstitial` behind `managed`),
+        // whose cookie the site wants before it serves the page, so run that stage too. The same
+        // stage again means the clearance does not work, and `accept_clearance` refuses it.
+        if let Some(next) = &next
+            && is_further_stage(next.kind.as_deref(), self.challenge.kind.as_deref())
+        {
+            sink.progress(&format!(
+                "The cleared page is still challenged, by a {} stage rather than {}; running it",
+                next.kind.as_deref().unwrap_or("further"),
+                self.challenge.kind.as_deref().unwrap_or("the first")
+            ));
+            return Ok(Cleared::NextStage {
+                document: cleared,
+                navigation,
+            });
+        }
+        let challenged = next.is_some();
         let cookies = client.cookies(&cleared.url);
         let clearance = cookies
             .iter()
@@ -540,11 +577,11 @@ impl Orchestration {
             cleared.status,
             cleared.html.len()
         ));
-        Ok(Clearance {
+        Ok(Cleared::Page(Clearance {
             clearance,
             cookies,
             page: cleared,
-        })
+        }))
     }
 
     /// Whether the challenge URL now carries a `cf_clearance` cookie, which a managed challenge's
@@ -582,6 +619,19 @@ impl Orchestration {
             .unwrap_or(&self.challenge.url);
         http::submit_form(client, referer, &form.action, &form.fields).await
     }
+}
+
+/// Whether the page that answered a stage's clearance guards itself with a *further* stage, which
+/// the session runs next, rather than the same challenge over again, which means the clearance
+/// does not work.
+///
+/// A page can stack challenges: it answers a `managed` clearance with a `precursor_interstitial`
+/// whose own cookie it wants before it serves the page. Each stage names its type in `cType`, so a
+/// different name is a further stage. A stage without a name, on either side, is treated as the
+/// same one, so a page that keeps challenging without saying why fails instead of looping.
+#[must_use]
+pub(crate) fn is_further_stage(cleared: Option<&str>, cleared_by: Option<&str>) -> bool {
+    matches!((cleared, cleared_by), (Some(next), Some(previous)) if next != previous)
 }
 
 /// Decides whether the challenge cleared, from the cleared page — the clearance form's response,

@@ -44,6 +44,10 @@ pub(crate) struct ChallengePage {
     pub loading: Url,
     /// Page address restored after the challenge, which the clearance form is submitted from.
     pub answered: Option<Url>,
+    /// The type Cloudflare names for this stage (`managed`, `precursor_interstitial`, …). A page
+    /// can guard its content with more than one stage, so the reload after a clearance compares
+    /// its stage against this one to tell a further stage from the same challenge again.
+    pub kind: Option<String>,
 }
 
 impl ChallengePage {
@@ -69,15 +73,21 @@ impl ChallengePage {
             "loading address",
         )?
         .context("challenge page shows no loading address")?;
-        let answered = source::bootstrap_options(script)
+        let options = source::bootstrap_options(script);
+        let answered = options
             .get(ANSWERED)
             .and_then(JsValue::as_str)
             .map(|address| url.join(address))
             .transpose()?;
+        let kind = options
+            .get("cType")
+            .and_then(JsValue::as_str)
+            .map(str::to_owned);
         Ok(Some(Self {
             orchestrator: url.join(orchestrator)?,
             loading: url.join(loading)?,
             answered,
+            kind,
             url: url.clone(),
             html: html.to_owned(),
             inline,
@@ -287,7 +297,7 @@ pub(crate) fn language(options: &Options) -> Option<&str> {
 mod tests {
     use super::*;
 
-    const PAGE: &str = r#"<html><body><script nonce="n">(function(){window._cf_chl_opt = {cH: 'token', cRay: 'ray', cUPMDTk: "/protected?__cf_chl_tk=answered"};var a = document.createElement('script');a.src = '/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1?ray=ray';if (window.history && window.history.replaceState) {history.replaceState(null, null,"/protected?__cf_chl_rt_tk=loading"+ window._cf_chl_opt.cOgUHash);}document.getElementsByTagName('head')[0].appendChild(a);}());</script></body></html>"#;
+    const PAGE: &str = r#"<html><body><script nonce="n">(function(){window._cf_chl_opt = {cType: 'managed', cH: 'token', cRay: 'ray', cUPMDTk: "/protected?__cf_chl_tk=answered"};var a = document.createElement('script');a.src = '/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1?ray=ray';if (window.history && window.history.replaceState) {history.replaceState(null, null,"/protected?__cf_chl_rt_tk=loading"+ window._cf_chl_opt.cOgUHash);}document.getElementsByTagName('head')[0].appendChild(a);}());</script></body></html>"#;
 
     #[test]
     fn finds_the_orchestrator_and_the_loading_address() {
@@ -305,6 +315,15 @@ mod tests {
             page.answered.unwrap().as_str(),
             "https://example.com/protected?__cf_chl_tk=answered"
         );
+        // The challenge type, which tells a further stage of the same page from the same
+        // challenge again.
+        assert_eq!(page.kind.as_deref(), Some("managed"));
+        let precursor = PAGE.replace("cType: 'managed'", "cType: 'precursor_interstitial'");
+        let precursor = ChallengePage::parse(&precursor, &url).unwrap().unwrap();
+        assert_eq!(precursor.kind.as_deref(), Some("precursor_interstitial"));
+        let untyped = PAGE.replace("cType: 'managed', ", "");
+        let untyped = ChallengePage::parse(&untyped, &url).unwrap().unwrap();
+        assert_eq!(untyped.kind, None);
         let widget = r#"<script>window._cf_chl_opt = {}; render();</script>"#;
         for html in [widget, "<p>no script</p>"] {
             assert!(
